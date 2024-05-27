@@ -68,49 +68,60 @@ class WebSocketEventService(
         client.set(currentClient)
         val name = satori.name
         GlobalScope.launch {
-            currentClient.webSocket(
-                HttpMethod.Get, properties.host, properties.port, "${properties.path}/${properties.version}/events"
-            ) {
-                try {
-                    open()
-                    sendSerialized(IdentifySignal(Identify(properties.token, sequence)))
-                    logger.info(name, "成功建立 WebSocket 连接, 尝试建立事件推送服务")
-                    withTimeoutOrNull(10000L) {
-                        val ready = receiveDeserialized<ReadySignal>().body
-                        connect(ready.logins, service, satori)
-                        status.set(Running)
-                        logger.info(name, "成功建立事件推送服务: ${ready.logins}")
-                    } ?: throw TimeoutException("无法建立事件推送服务: READY 响应超时")
-                    sendPing()
-                    while (true) try {
-                        when (val signal = receiveDeserialized<Signal>()) {
-                            is EventSignal -> onEvent(signal.body)
-                            is PongSignal -> {
-                                is_received_pong.set(true)
-                                logger.debug(name, "收到 PONG")
-                                sendPing()
+            try {
+                currentClient.webSocket(
+                    HttpMethod.Get, properties.host, properties.port, "${properties.path}/${properties.version}/events"
+                ) {
+                    try {
+                        open()
+                        sendSerialized(IdentifySignal(Identify(properties.token, sequence)))
+                        logger.info(name, "成功建立 WebSocket 连接, 尝试建立事件推送服务")
+                        withTimeoutOrNull(10000L) {
+                            val ready = receiveDeserialized<ReadySignal>().body
+                            connect(ready.logins, service, satori)
+                            status.set(Running)
+                            logger.info(name, "成功建立事件推送服务: ${ready.logins}")
+                        } ?: throw TimeoutException("无法建立事件推送服务: READY 响应超时")
+                        sendPing()
+                        while (true) try {
+                            when (val signal = receiveDeserialized<Signal>()) {
+                                is EventSignal -> onEvent(signal.body)
+                                is PongSignal -> {
+                                    is_received_pong.set(true)
+                                    logger.debug(name, "收到 PONG")
+                                    sendPing()
+                                }
                             }
+                        } catch (e: JsonConvertException) {
+                            logger.warn(name, "事件解析错误: ${e.localizedMessage}")
                         }
-                    } catch (e: JsonConvertException) {
-                        logger.warn(name, "事件解析错误: ${e.localizedMessage}")
-                    }
-                } catch (e: Exception) {
-                    if (currentClient == client.get() || status.get() == Running) {
+                    } catch (e: Exception) {
+                        reconnectLock.withLock {
+                            if (currentClient == client.get() && status.get() == Running) {
+                                status.set(Reconnecting)
+                                error()
+                                logger.warn(name, "WebSocket 连接断开: ${e.localizedMessage}")
 
-                        status.set(Reconnecting)
-                        error()
-                        logger.warn(name, "WebSocket 连接断开: ${e.localizedMessage}")
-
-                        launch {
-                            e.printStackTrace()
-                            close()
-                            logger.info(name, "将在5秒后尝试重新连接")
-                            delay(5000)
-                            logger.info(name, "尝试重新连接")
-                            reconnect()
+                                launch {
+                                    e.printStackTrace()
+                                    close()
+                                    logger.info(name, "将在5秒后尝试重新连接")
+                                    delay(5000)
+                                    logger.info(name, "尝试重新连接")
+                                    reconnect()
+                                }
+                            }
                         }
                     }
                 }
+            } catch (e: Exception) {
+                error()
+                logger.warn(name, "WebSocket 连接建立失败: ${e.localizedMessage}")
+                e.printStackTrace()
+                logger.info(name, "将在5秒后尝试重新连接")
+                delay(5000)
+                logger.info(name, "尝试重新连接")
+                reconnect()
             }
         }
     }
@@ -122,16 +133,20 @@ class WebSocketEventService(
         val name = satori.name
         logger.debug(name, "发送 PING")
         delay(10000)
-        if (!is_received_pong.get() && this@sendPing.call.client == client.get() && status.get() == Running) {
-            status.set(Reconnecting)
-            error()
-            logger.warn(name, "WebSocket 连接断开: PONG 响应超时")
-            launch {
-                close()
-                logger.info(name, "将在5秒后尝试重新连接")
-                delay(5000)
-                logger.info(name, "尝试重新连接")
-                reconnect()
+        // Mutex保证状态的更新和重连接为一个原子操作，不被途中插入
+        // AtomicReference保证多线程可见性
+        reconnectLock.withLock {
+            if (!is_received_pong.get() && this@sendPing.call.client == client.get() && status.get() == Running) {
+                status.set(Reconnecting)
+                error()
+                logger.warn(name, "WebSocket 连接断开: PONG 响应超时")
+                launch {
+                    close()
+                    logger.info(name, "将在5秒后尝试重新连接")
+                    delay(5000)
+                    logger.info(name, "尝试重新连接")
+                    reconnect()
+                }
             }
         }
     }
@@ -168,7 +183,7 @@ class WebSocketEventService(
         status.set(Stopped)
     }
 
-    override suspend fun reconnect() = reconnectLock.withLock {
+    override suspend fun reconnect() { //TODO: 外部调用多线程问题
         client.get()?.close()
         client.set(null)
         connect()
